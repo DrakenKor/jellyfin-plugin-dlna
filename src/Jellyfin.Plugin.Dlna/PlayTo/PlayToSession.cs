@@ -612,14 +612,16 @@ public class PlayToSession : ISessionController, IDisposable
         }
     }
 
+    // A renderer seeks a file or a complete HLS playlist by itself. Core builds HLS urls without a start
+    // position, so handing over a new url would restart an HLS stream from the beginning.
     private static bool EnableClientSideSeek(StreamParams info)
     {
-        return info.IsDirectStream;
+        return info.IsDirectStream || info.IsHls;
     }
 
     private static bool EnableClientSideSeek(StreamInfo info)
     {
-        return info.IsDirectStream;
+        return info.IsDirectStream || info.SubProtocol == MediaStreamProtocol.hls;
     }
 
     private void AddItemFromId(Guid id, IReadOnlyCollection<MediaType> supportedMediaTypes, List<BaseItem> list)
@@ -1040,6 +1042,8 @@ public class PlayToSession : ISessionController, IDisposable
 
         public bool IsDirectStream { get; set; }
 
+        public bool IsHls { get; set; }
+
         public long StartPositionTicks { get; set; }
 
         public int? AudioStreamIndex { get; set; }
@@ -1127,6 +1131,7 @@ public class PlayToSession : ISessionController, IDisposable
             request.MediaSourceId = values.GetValueOrDefault("MediaSourceId");
             request.LiveStreamId = values.GetValueOrDefault("LiveStreamId");
             request.IsDirectStream = string.Equals("true", values.GetValueOrDefault("Static"), StringComparison.OrdinalIgnoreCase);
+            request.IsHls = url[..index].EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase);
             request.AudioStreamIndex = GetIntValue(values, "AudioStreamIndex");
             request.SubtitleStreamIndex = GetIntValue(values, "SubtitleStreamIndex");
             request.StartPositionTicks = GetLongValue(values, "StartPositionTicks");
