@@ -1129,7 +1129,7 @@ public class PlayToSession : ISessionController, IDisposable
             request.IsDirectStream = string.Equals("true", values.GetValueOrDefault("Static"), StringComparison.OrdinalIgnoreCase);
             request.AudioStreamIndex = GetIntValue(values, "AudioStreamIndex");
             request.SubtitleStreamIndex = GetIntValue(values, "SubtitleStreamIndex");
-            request.StartPositionTicks = GetLongValue(values, "StartPositionTicks");
+            request.StartPositionTicks = GetLongValue(values, "StartTimeTicks");
 
             request.Item = libraryManager.GetItemById(request.ItemId);
 
