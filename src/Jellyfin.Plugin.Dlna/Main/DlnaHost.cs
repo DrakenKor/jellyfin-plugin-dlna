@@ -16,11 +16,11 @@ using MediaBrowser.Common.Extensions;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
-using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Session;
+using MediaBrowser.Controller.Streaming;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Rssdp;
@@ -47,7 +47,7 @@ public sealed class DlnaHost : IHostedService, IDisposable
     private readonly IMediaSourceManager _mediaSourceManager;
     private readonly IMediaEncoder _mediaEncoder;
     private readonly IDeviceDiscovery _deviceDiscovery;
-    private readonly IDeviceManager _deviceManager;
+    private readonly IPlaybackAccessManager _playbackAccessManager;
     private readonly ISsdpCommunicationsServer _communicationsServer;
     private readonly INetworkManager _networkManager;
     private readonly object _syncLock = new();
@@ -75,7 +75,7 @@ public sealed class DlnaHost : IHostedService, IDisposable
     /// <param name="mediaEncoder">The <see cref="IMediaEncoder"/>.</param>
     /// <param name="communicationsServer">The <see cref="ISsdpCommunicationsServer"/>.</param>
     /// <param name="networkManager">The <see cref="INetworkManager"/>.</param>
-    /// <param name="deviceManager">The <see cref="IDeviceManager"/>.</param>
+    /// <param name="playbackAccessManager">The <see cref="IPlaybackAccessManager"/>.</param>
     public DlnaHost(
         IServerConfigurationManager config,
         ILoggerFactory loggerFactory,
@@ -93,7 +93,7 @@ public sealed class DlnaHost : IHostedService, IDisposable
         IMediaEncoder mediaEncoder,
         ISsdpCommunicationsServer communicationsServer,
         INetworkManager networkManager,
-        IDeviceManager deviceManager)
+        IPlaybackAccessManager playbackAccessManager)
     {
         _config = config;
         _appHost = appHost;
@@ -110,7 +110,7 @@ public sealed class DlnaHost : IHostedService, IDisposable
         _mediaEncoder = mediaEncoder;
         _communicationsServer = communicationsServer;
         _networkManager = networkManager;
-        _deviceManager = deviceManager;
+        _playbackAccessManager = playbackAccessManager;
         _logger = loggerFactory.CreateLogger<DlnaHost>();
     }
 
@@ -362,7 +362,7 @@ public sealed class DlnaHost : IHostedService, IDisposable
                     _localization,
                     _mediaSourceManager,
                     _mediaEncoder,
-                    _deviceManager);
+                    _playbackAccessManager);
 
                 _manager.Start();
             }

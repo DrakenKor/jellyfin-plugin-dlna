@@ -5,19 +5,17 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Events;
-using Jellyfin.Data.Queries;
 using Jellyfin.Plugin.Dlna.Localization;
 using Jellyfin.Plugin.Dlna.Model;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller;
-using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Session;
+using MediaBrowser.Controller.Streaming;
 using MediaBrowser.Model.Session;
 using Microsoft.Extensions.Logging;
-using AuthDevice = Jellyfin.Database.Implementations.Entities.Security.Device;
 using IDlnaManager = Jellyfin.Plugin.Dlna.Model.IDlnaManager;
 
 namespace Jellyfin.Plugin.Dlna.PlayTo;
@@ -31,7 +29,7 @@ public sealed class PlayToManager : IDisposable
     private readonly ISessionManager _sessionManager;
     private readonly ILibraryManager _libraryManager;
     private readonly IUserManager _userManager;
-    private readonly IDeviceManager _deviceManager;
+    private readonly IPlaybackAccessManager _playbackAccessManager;
     private readonly IDlnaManager _dlnaManager;
     private readonly IServerApplicationHost _appHost;
     private readonly IImageProcessor _imageProcessor;
@@ -61,7 +59,7 @@ public sealed class PlayToManager : IDisposable
     /// <param name="localization">Instance of the <see cref="DlnaLocalization"/> class.</param>
     /// <param name="mediaSourceManager">Instance of the <see cref="IMediaSourceManager"/> interface.</param>
     /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
-    /// <param name="deviceManager">Instance of the <see cref="IDeviceManager"/> interface.</param>
+    /// <param name="playbackAccessManager">Instance of the <see cref="IPlaybackAccessManager"/> interface.</param>
     public PlayToManager(
         ILogger logger,
         ISessionManager sessionManager,
@@ -76,7 +74,7 @@ public sealed class PlayToManager : IDisposable
         DlnaLocalization localization,
         IMediaSourceManager mediaSourceManager,
         IMediaEncoder mediaEncoder,
-        IDeviceManager deviceManager)
+        IPlaybackAccessManager playbackAccessManager)
     {
         _logger = logger;
         _sessionManager = sessionManager;
@@ -91,7 +89,7 @@ public sealed class PlayToManager : IDisposable
         _localization = localization;
         _mediaSourceManager = mediaSourceManager;
         _mediaEncoder = mediaEncoder;
-        _deviceManager = deviceManager;
+        _playbackAccessManager = playbackAccessManager;
     }
 
     /// <summary>
@@ -279,7 +277,7 @@ public sealed class PlayToManager : IDisposable
                 _userManager,
                 _imageProcessor,
                 serverAddress,
-                await GetAccessToken(uuid, deviceName).ConfigureAwait(false),
+                _playbackAccessManager,
                 _deviceDiscovery,
                 _userDataManager,
                 _localization,
@@ -316,26 +314,6 @@ public sealed class PlayToManager : IDisposable
 
             _logger.LogInformation("DLNA Session created for {0} - {1} using profile {2}", device.Properties.Name, device.Properties.ModelName, profile.Name);
         }
-    }
-
-    // HLS is served by core, which only answers authenticated requests. The renderer is registered as a device
-    // of the default user and handed that device's token. Without a default user it stays unauthenticated.
-    private async Task<string?> GetAccessToken(string deviceId, string deviceName)
-    {
-        var userId = DlnaPlugin.Instance.Configuration.DefaultUserId;
-        if (userId is null || _userManager.GetUserById(userId.Value) is null)
-        {
-            return null;
-        }
-
-        var existing = _deviceManager.GetDevices(new DeviceQuery { UserId = userId, DeviceId = deviceId }).Items;
-        if (existing.Count > 0)
-        {
-            return existing[0].AccessToken;
-        }
-
-        var device = await _deviceManager.CreateDevice(new AuthDevice(userId.Value, "DLNA", _appHost.ApplicationVersionString, deviceName, deviceId)).ConfigureAwait(false);
-        return device.AccessToken;
     }
 
     /// <inheritdoc />

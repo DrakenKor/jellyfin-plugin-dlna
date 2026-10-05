@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -17,6 +18,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Session;
+using MediaBrowser.Controller.Streaming;
 using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Session;
@@ -51,8 +53,9 @@ public class PlayToSession : ISessionController, IDisposable
     private readonly IMediaEncoder _mediaEncoder;
     private readonly IDeviceDiscovery _deviceDiscovery;
     private readonly string _serverAddress;
-    private readonly string? _accessToken;
+    private readonly IPlaybackAccessManager _playbackAccessManager;
     private readonly List<PlaylistItem> _playlist = [];
+    private readonly ConcurrentDictionary<string, Guid> _playbackGrantOwners = new(StringComparer.Ordinal);
     private Device _device;
     private int _currentPlaylistIndex;
     private int _nextTrackIndex = -1;
@@ -70,7 +73,7 @@ public class PlayToSession : ISessionController, IDisposable
     /// <param name="userManager">Instance of the <see cref="IUserManager"/> interface.</param>
     /// <param name="imageProcessor">Instance of the <see cref="IImageProcessor"/> interface.</param>
     /// <param name="serverAddress">The server address.</param>
-    /// <param name="accessToken">The access token.</param>
+    /// <param name="playbackAccessManager">The playback access manager.</param>
     /// <param name="deviceDiscovery">Instance of the <see cref="IDeviceDiscovery"/> interface.</param>
     /// <param name="userDataManager">Instance of the <see cref="IUserDataManager"/> interface.</param>
     /// <param name="localization">Instance of the <see cref="DlnaLocalization"/> class.</param>
@@ -86,7 +89,7 @@ public class PlayToSession : ISessionController, IDisposable
         IUserManager userManager,
         IImageProcessor imageProcessor,
         string serverAddress,
-        string? accessToken,
+        IPlaybackAccessManager playbackAccessManager,
         IDeviceDiscovery deviceDiscovery,
         IUserDataManager userDataManager,
         DlnaLocalization localization,
@@ -102,7 +105,7 @@ public class PlayToSession : ISessionController, IDisposable
         _userManager = userManager;
         _imageProcessor = imageProcessor;
         _serverAddress = serverAddress;
-        _accessToken = accessToken;
+        _playbackAccessManager = playbackAccessManager;
         _deviceDiscovery = deviceDiscovery;
         _userDataManager = userDataManager;
         _localization = localization;
@@ -156,6 +159,8 @@ public class PlayToSession : ISessionController, IDisposable
 
             try
             {
+                await PreparePlaybackAccess(nextItem, cancellationToken).ConfigureAwait(false);
+
                 // Send the SetNextAvTransport message. A device that accepts it advances to that track by
                 // itself, which OnDevicePlaybackStopped has to know about to not advance the playlist again.
                 if (await _device.SetNextAvTransport(nextItem.StreamUrl, GetDlnaHeaders(nextItem), nextItem.Didl, cancellationToken).ConfigureAwait(false))
@@ -200,12 +205,13 @@ public class PlayToSession : ISessionController, IDisposable
         await SendNextTrackMessage(currentIndex, cancellationToken).ConfigureAwait(false);
     }
 
-    private Task SetAvTransport(PlaylistItem item, CancellationToken cancellationToken)
+    private async Task SetAvTransport(PlaylistItem item, CancellationToken cancellationToken)
     {
         _nextTrackIndex = -1;
         _nextTrackAnnouncedFor = null;
 
-        return _device.SetAvTransport(item.StreamUrl, GetDlnaHeaders(item), item.Didl, cancellationToken);
+        await PreparePlaybackAccess(item, cancellationToken).ConfigureAwait(false);
+        await _device.SetAvTransport(item.StreamUrl, GetDlnaHeaders(item), item.Didl, cancellationToken).ConfigureAwait(false);
     }
 
     private async void OnDeviceUnavailable()
@@ -338,6 +344,21 @@ public class PlayToSession : ISessionController, IDisposable
 
     private async Task ReportPlaybackStopped(StreamParams streamInfo, long? positionTicks)
     {
+        if (streamInfo.PlaySessionId is { } playSessionId && _playbackGrantOwners.TryRemove(playSessionId, out var userId))
+        {
+            _playbackAccessManager.Revoke(playSessionId, userId);
+            foreach (var item in _playlist)
+            {
+                if (string.Equals(item.StreamInfo.PlaySessionId, playSessionId, StringComparison.Ordinal))
+                {
+                    // Replaying an earlier queue entry needs a fresh grant, rather than
+                    // reusing one that is only valid for outstanding stop-time requests.
+                    item.StreamInfo.PlaybackToken = null;
+                    item.StreamInfo.PlaySessionId = null;
+                }
+            }
+        }
+
         try
         {
             await _sessionManager.OnPlaybackStopped(new PlaybackStopInfo
@@ -345,7 +366,8 @@ public class PlayToSession : ISessionController, IDisposable
                 ItemId = streamInfo.ItemId,
                 SessionId = _session.Id,
                 PositionTicks = positionTicks,
-                MediaSourceId = streamInfo.MediaSourceId
+                MediaSourceId = streamInfo.MediaSourceId,
+                PlaySessionId = streamInfo.PlaySessionId
             }).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -433,6 +455,7 @@ public class PlayToSession : ISessionController, IDisposable
         {
             ItemId = info.ItemId,
             SessionId = _session.Id,
+            PlaySessionId = info.PlaySessionId,
             PositionTicks = GetProgressPositionTicks(info),
             IsMuted = _device.IsMuted,
             IsPaused = _device.IsPaused,
@@ -658,21 +681,66 @@ public class PlayToSession : ISessionController, IDisposable
         int? subtitleStreamIndex,
         DlnaDeviceProfile profile)
     {
+        // The controlling user authorizes casts. The configured default user supplies the
+        // viewing policy when a playback command has no controlling user.
+        var defaultUserId = DlnaPlugin.Instance.Configuration.DefaultUserId;
+        user ??= defaultUserId.HasValue ? _userManager.GetUserById(defaultUserId.Value) : null;
+
         var mediaSources = item is IHasMediaSources
             ? _mediaSourceManager.GetStaticMediaSources(item, true, user).ToArray()
             : [];
 
         var playlistItem = GetPlaylistItem(item, mediaSources, profile, _session.DeviceId, mediaSourceId, audioStreamIndex, subtitleStreamIndex);
         playlistItem.StreamInfo.StartPositionTicks = startPostionTicks;
+        playlistItem.UserId = user?.Id;
 
-        playlistItem.StreamUrl = DidlBuilder.NormalizeDlnaMediaUrl(playlistItem.StreamInfo.ToDlnaUrl(_serverAddress, _accessToken));
+        BuildPlaylistMetadata(playlistItem, item, user);
+        return playlistItem;
+    }
 
-        var itemXml = new DidlBuilder(
-                profile,
+    private async Task PreparePlaybackAccess(PlaylistItem item, CancellationToken cancellationToken)
+    {
+        var streamInfo = item.StreamInfo;
+        if (streamInfo.SubProtocol != MediaStreamProtocol.hls)
+        {
+            return;
+        }
+
+        if (streamInfo.PlaybackToken is not null && _playbackAccessManager.Get(streamInfo.PlaybackToken) is not null)
+        {
+            _playbackAccessManager.Touch(streamInfo.PlaybackToken);
+            return;
+        }
+
+        var userId = item.UserId ?? throw new InvalidOperationException("HLS playback requires a controlling user or a configured DLNA default user.");
+        if (string.IsNullOrEmpty(streamInfo.PlaySessionId))
+        {
+            streamInfo.PlaySessionId = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+        }
+
+        var grant = await _playbackAccessManager.CreateAsync(
+            userId,
+            streamInfo.ItemId,
+            streamInfo.MediaSourceId ?? throw new InvalidOperationException("HLS playback requires a media source."),
+            _session.DeviceId,
+            streamInfo.PlaySessionId,
+            cancellationToken).ConfigureAwait(false);
+        streamInfo.PlaybackToken = grant.Token;
+        _playbackGrantOwners[grant.PlaySessionId] = grant.UserId;
+        var libraryItem = _libraryManager.GetItemById(streamInfo.ItemId)
+            ?? throw new InvalidOperationException("The playback item no longer exists.");
+        BuildPlaylistMetadata(item, libraryItem, _userManager.GetUserById(userId));
+    }
+
+    private void BuildPlaylistMetadata(PlaylistItem playlistItem, BaseItem item, User? user)
+    {
+        playlistItem.StreamUrl = DidlBuilder.NormalizeDlnaMediaUrl(playlistItem.StreamInfo.ToDlnaUrl(_serverAddress, null));
+        playlistItem.Didl = new DidlBuilder(
+                playlistItem.Profile,
                 user,
                 _imageProcessor,
                 _serverAddress,
-                _accessToken,
+                null,
                 _userDataManager,
                 _localization,
                 _mediaSourceManager,
@@ -680,10 +748,6 @@ public class PlayToSession : ISessionController, IDisposable
                 _mediaEncoder,
                 _libraryManager)
             .GetItemDidl(item, user, null, _session.DeviceId, new Filter(), playlistItem.StreamInfo);
-
-        playlistItem.Didl = itemXml;
-
-        return playlistItem;
     }
 
     private static string? GetDlnaHeaders(PlaylistItem item)
@@ -796,6 +860,13 @@ public class PlayToSession : ISessionController, IDisposable
 
     private void ClearPlaylist()
     {
+        foreach (var grant in _playbackGrantOwners)
+        {
+            _playbackAccessManager.Revoke(grant.Key, grant.Value);
+        }
+
+        _playbackGrantOwners.Clear();
+
         _playlist.Clear();
         _nextTrackIndex = -1;
         _nextTrackAnnouncedFor = null;
@@ -842,6 +913,7 @@ public class PlayToSession : ISessionController, IDisposable
 
         if (disposing)
         {
+            ClearPlaylist();
             _device.PlaybackStart -= OnDevicePlaybackStart;
             _device.PlaybackProgress -= OnDevicePlaybackProgress;
             _device.PlaybackStopped -= OnDevicePlaybackStopped;
@@ -1044,6 +1116,8 @@ public class PlayToSession : ISessionController, IDisposable
 
         public bool IsHls { get; set; }
 
+        public string? PlaySessionId { get; set; }
+
         public long StartPositionTicks { get; set; }
 
         public int? AudioStreamIndex { get; set; }
@@ -1131,6 +1205,7 @@ public class PlayToSession : ISessionController, IDisposable
             request.MediaSourceId = values.GetValueOrDefault("MediaSourceId");
             request.LiveStreamId = values.GetValueOrDefault("LiveStreamId");
             request.IsDirectStream = string.Equals("true", values.GetValueOrDefault("Static"), StringComparison.OrdinalIgnoreCase);
+            request.PlaySessionId = values.GetValueOrDefault("PlaySessionId");
             request.IsHls = url[..index].EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase);
             request.AudioStreamIndex = GetIntValue(values, "AudioStreamIndex");
             request.SubtitleStreamIndex = GetIntValue(values, "SubtitleStreamIndex");
