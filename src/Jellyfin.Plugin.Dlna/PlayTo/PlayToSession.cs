@@ -708,7 +708,6 @@ public class PlayToSession : ISessionController, IDisposable
 
         if (streamInfo.PlaybackToken is not null && _playbackAccessManager.Get(streamInfo.PlaybackToken) is not null)
         {
-            _playbackAccessManager.Touch(streamInfo.PlaybackToken);
             return;
         }
 
